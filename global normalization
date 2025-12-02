@@ -1,0 +1,1310 @@
+#edit the code for working currectly for normalization
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+"""
+
+3D Desmin Aggregation + Full Per-Cell Features (macOS paths)
+
+===========================================================
+
+
+
+Single-image version with paths defined INSIDE the code.
+
+Edit the USER INPUT section (Mac paths) and run.
+
+
+
+This script:
+
+- Segments cells from DAPI
+
+- Measures Desmin & Sarcomere area per cell
+
+- Computes Desmin aggregation using percentiles
+
+- Extracts 3D-style morphology + intensity features
+
+- Saves overlays & heatmaps
+
+- **Saves the cell segmentation labels as a TIFF aligned with Desmin**
+
+"""
+
+
+
+from __future__ import annotations
+
+import sys
+
+from pathlib import Path
+
+from typing import Tuple, List, Dict
+
+
+
+import numpy as np
+
+import pandas as pd
+
+import matplotlib.pyplot as plt
+
+import matplotlib as mpl
+
+
+
+from skimage import io, color
+
+from skimage.filters import gaussian, threshold_otsu
+
+from skimage.morphology import remove_small_objects, dilation, square
+
+from skimage.measure import label, regionprops
+
+from skimage.segmentation import watershed, clear_border, find_boundaries, relabel_sequential
+
+from scipy.ndimage import binary_fill_holes, distance_transform_edt
+
+from matplotlib.patches import Circle
+
+
+
+
+
+# ======================================================================
+
+#  USER INPUT: PATHS & SETTINGS  (MACOS VERSION – EDIT HERE)
+
+# ======================================================================
+
+
+
+# Example:
+
+# DAPI_PATH   = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/.../DAPI.tif")
+
+# DESMIN_PATH = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/.../Desmin.tif")
+
+# SARC_PATH   = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/.../Actinin.tif")
+
+# OUT_DIR     = Path("/Users/baharehbahmani/Desktop/LAB/3D/results/R120G_1")
+
+
+
+DAPI_PATH       = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/IF Bortezomib-selected/R120G Bortez stiff_1/R120G Bortez stiff_1.oib - C=0.tif")      # <-- EDIT
+
+DESMIN_PATH     = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/IF Bortezomib-selected/R120G Bortez stiff_1/R120G Bortez stiff_1.oib - C=2.tif")    # <-- EDIT (or set to None)
+
+DESMIN_BIN_PATH = None   # e.g. Path("/Users/yourname/Desktop/.../Desmin_binary.tif") OR None
+
+SARC_PATH       = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/IF Bortezomib-selected/R120G Bortez stiff_1/R120G Bortez stiff_1.oib - C=1.tif")   # <-- EDIT
+
+OUT_DIR         = Path("/Users/baharehbahmani/Desktop/LAB/3D/Bortez/IF Bortezomib-selected/R120G Bortez stiff_1/resultsnew test")       # <-- EDIT
+
+
+
+# Optional: intensity thresholds (None = Otsu)
+
+DESMIN_THR = None   # e.g. 0.3 or 25 or None (use Otsu)
+
+SARC_THR   = None   # e.g. 0.4 or None (use Otsu)
+
+
+
+# Segmentation parameters
+
+GAUSS_SIGMA       = 2.0   # smoothing for DAPI
+
+MIN_NUCLEUS_AREA  = 1000  # min cell/nucleus area in pixels
+
+
+
+# Aggregation parameters
+
+MIN_DESMIN_AREA   = 100   # min Desmin-positive pixels to include in percentile calc
+
+DES_PCT           = 75.0  # percentile for "high" Desmin fraction
+
+SARC_PCT          = 75.0  # percentile for "not-high" sarcomere fraction (75 = median)
+
+
+
+# Overlays (True/False)
+
+SAVE_SARC_OVERLAY   = True    # save Sarcomere_withBorders_IDs.png
+
+SAVE_DESMIN_OVERLAY = True    # save DesminOnly_NoSarcomere_withBorders_IDs.png
+
+SAVE_AGG_OVERLAY    = True    # save overlay_aggregated.png
+
+
+
+# Normalization parameters (NEW)
+
+USE_GLOBAL_NORMALIZATION = True   # If True, normalize all images to same range using percentiles
+
+NORM_PERCENTILE_LOW  = 1.0   # Lower percentile for normalization (1.0 = 1st percentile)
+
+NORM_PERCENTILE_HIGH = 99.0  # Upper percentile for normalization (99.0 = 99th percentile)
+
+
+
+# Environment check (optional)
+
+CHECK_ENV           = False   # if True, prints interpreter path and tries to import SarcAsM
+
+
+
+# ======================================================================
+
+#  END OF USER INPUT
+
+# ======================================================================
+
+
+
+
+
+def load_image_raw(path: Path) -> np.ndarray:
+
+    """Load an image and return raw float array (not normalized)."""
+
+    im = io.imread(str(path))
+
+    if im.ndim == 3:
+
+        if im.shape[-1] == 4:
+
+            im = im[..., :3]
+
+        im = color.rgb2gray(im)
+
+    im = im.astype(np.float32)
+
+    return im
+
+
+
+
+
+def normalize_image_global(images: List[np.ndarray],
+
+                           p_low: float = 1.0,
+
+                           p_high: float = 99.0) -> List[np.ndarray]:
+
+    """
+
+    Normalize multiple images to the same intensity range using global percentiles.
+
+    This ensures all images are displayed with the same brightness/contrast scale.
+
+    
+
+    Args:
+
+        images: List of raw image arrays
+
+        p_low: Lower percentile for normalization (default 1.0)
+
+        p_high: Upper percentile for normalization (default 99.0)
+
+    
+
+    Returns:
+
+        List of normalized images in [0, 1] range
+
+    """
+
+    # Compute percentiles across all images
+
+    all_values = np.concatenate([im.flatten() for im in images])
+
+    vmin_global = np.percentile(all_values, p_low)
+
+    vmax_global = np.percentile(all_values, p_high)
+
+    
+    # Normalize each image using the global range
+
+    normalized = []
+
+    for im in images:
+
+        im_norm = np.clip((im - vmin_global) / max(1e-8, (vmax_global - vmin_global)), 0.0, 1.0)
+
+        normalized.append(im_norm)
+
+    
+
+    return normalized, vmin_global, vmax_global
+
+
+
+
+
+def load_image_gray(path: Path, vmin: float | None = None, vmax: float | None = None) -> np.ndarray:
+
+    """
+
+    Load an image and return float grayscale in [0,1].
+
+    If vmin/vmax are provided, use them for normalization (global normalization).
+
+    Otherwise, normalize per-image (legacy behavior).
+
+    """
+
+    im = load_image_raw(path)
+
+    
+    if vmin is not None and vmax is not None:
+
+        # Use provided global normalization range
+
+        im = np.clip((im - vmin) / max(1e-8, (vmax - vmin)), 0.0, 1.0)
+
+    else:
+
+        # Legacy per-image normalization
+
+        if im.max() > 1.0:
+
+            if im.max() <= 255.0:
+
+                im = im / 255.0
+
+            else:
+
+                im = (im - im.min()) / max(1e-8, (im.max() - im.min()))
+
+        im = np.clip(im, 0.0, 1.0)
+
+    
+    return im
+
+
+
+
+
+def binarize_gray(im01: np.ndarray, thr: float | None) -> np.ndarray:
+
+    """Threshold grayscale [0,1] to bool; if thr None use Otsu; accept 0..1 or 0..255."""
+
+    if thr is None:
+
+        t = threshold_otsu(im01)
+
+    else:
+
+        t = thr / 255.0 if thr > 1.0 else thr
+
+    return im01 > t
+
+
+
+
+
+def segment_cells_from_dapi(dapi: np.ndarray,
+
+                            gauss_sigma: float,
+
+                            min_nucleus_area: int) -> np.ndarray:
+
+    """Simple watershed nuclei segmentation from DAPI, expanded to Voronoi-like cells."""
+
+    sm = gaussian(dapi, sigma=gauss_sigma, preserve_range=True)
+
+    t = threshold_otsu(sm)
+
+    bw = sm > t
+
+
+
+    bw = remove_small_objects(bw, min_size=int(min_nucleus_area * 0.5))
+
+    bw = binary_fill_holes(bw)
+
+
+
+    dist = distance_transform_edt(bw)
+
+    markers = label(bw)
+
+    nuc = watershed(-dist, markers=markers, mask=bw)
+
+    nuc = clear_border(nuc)
+
+    nuc, _, _ = relabel_sequential(nuc)
+
+
+
+    dist_bg = distance_transform_edt(nuc == 0)
+
+    cells = watershed(-dist_bg, nuc, mask=np.ones_like(nuc, dtype=bool))
+
+    cells, _, _ = relabel_sequential(cells)
+
+
+
+    keep = np.zeros_like(cells)
+
+    cur = 1
+
+    for reg in regionprops(cells):
+
+        if reg.area >= min_nucleus_area:
+
+            keep[cells == reg.label] = cur
+
+            cur += 1
+
+    return keep
+
+
+
+
+
+def per_cell_table(labels: np.ndarray,
+
+                   des_bw: np.ndarray,
+
+                   sar_bw: np.ndarray) -> pd.DataFrame:
+
+    rows: List[Dict] = []
+
+    for reg in regionprops(labels):
+
+        lab = reg.label
+
+        mask = (labels == lab)
+
+        area = int(reg.area)
+
+        d_area = int(np.sum(des_bw[mask]))
+
+        s_area = int(np.sum(sar_bw[mask]))
+
+        rows.append({
+
+            "cell_id": lab,
+
+            "cell_area": area,
+
+            "desmin_area": d_area,
+
+            "sarcomere_area": s_area,
+
+            "desmin_fraction": d_area / max(area, 1),
+
+            "sarcomere_fraction": s_area / max(area, 1),
+
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+
+
+def compute_cutoffs(valid: pd.DataFrame,
+
+                    des_pct: float,
+
+                    sarc_pct: float) -> Tuple[float, float]:
+
+    d_cut = float(np.percentile(valid["desmin_fraction"], des_pct))
+
+    s_cut = float(np.percentile(valid["sarcomere_fraction"], sarc_pct))
+
+    return d_cut, s_cut
+
+
+
+
+
+def classify(df: pd.DataFrame,
+
+             min_desmin_area: int,
+
+             d_cut: float,
+
+             s_cut: float) -> pd.DataFrame:
+
+    out = df.copy()
+
+    out["passes_min_desmin_area"] = out["desmin_area"] > min_desmin_area
+
+    out["desmin_agg"] = (
+
+        (out["passes_min_desmin_area"]) &
+
+        (out["desmin_fraction"] >= d_cut) &
+
+        (out["sarcomere_fraction"] <= s_cut)
+
+    )
+
+    return out
+
+
+
+
+
+def save_overlay_borders(background: np.ndarray,
+
+                         labels: np.ndarray,
+
+                         ids: List[int],
+
+                         out_path: Path,
+
+                         title: str) -> None:
+
+    bounds = find_boundaries(labels, connectivity=2, mode="outer")
+
+    bounds = dilation(bounds, square(3))
+
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+
+    ax.imshow(background, cmap="gray")
+
+    ax.imshow(np.ma.masked_where(~bounds, bounds), cmap=plt.cm.spring, alpha=1.0)
+
+    for reg in regionprops(labels):
+
+        if reg.label in ids:
+
+            y, x = reg.centroid
+
+            ax.text(x, y, str(reg.label),
+
+                    color="cyan", fontsize=8, fontweight="bold",
+
+                    ha="center", va="center")
+
+    ax.axis("off")
+
+    ax.set_title(title)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+
+    plt.close(fig)
+
+
+
+
+
+def desmin_only_mask(des_gray01: np.ndarray,
+
+                     sar_gray01: np.ndarray,
+
+                     des_thr: float | None,
+
+                     sar_thr: float | None) -> np.ndarray:
+
+    b_des = binarize_gray(des_gray01, des_thr)
+
+    b_sar = binarize_gray(sar_gray01, sar_thr)
+
+    return np.logical_and(b_des, np.logical_not(b_sar))
+
+
+
+
+
+def full_feature_table(labels: np.ndarray,
+
+                       des_gray01: np.ndarray,
+
+                       des_bw: np.ndarray) -> pd.DataFrame:
+
+    cell_data: List[List[float]] = []
+
+    props = regionprops(labels, intensity_image=des_gray01)
+
+
+
+    for reg in props:
+
+        label_id = reg.label
+
+        mask = (labels == label_id)
+
+        area = float(reg.area)
+
+        perimeter = float(reg.perimeter) if reg.perimeter > 0 else 1.0
+
+
+
+        elongation = (
+
+            float(reg.major_axis_length) / float(reg.minor_axis_length)
+
+            if reg.minor_axis_length > 0 else 0.0
+
+        )
+
+        eccentricity = float(reg.eccentricity)
+
+        circularity = float(4.0 * np.pi * area / (perimeter ** 2))
+
+
+
+        cy, cx = reg.centroid
+
+        mean_intensity = float(reg.mean_intensity)
+
+        total_intensity = float(mean_intensity * area)
+
+
+
+        des_pos_area = float(np.sum(des_bw[mask]))
+
+        des_percent = 100.0 * des_pos_area / max(area, 1.0)
+
+
+
+        cell_data.append([
+
+            int(label_id), area, elongation, eccentricity, circularity,
+
+            float(cx), float(cy), mean_intensity, total_intensity,
+
+            des_pos_area, des_percent
+
+        ])
+
+
+
+    columns = [
+
+        "cell_id", "area_pix", "elongation", "eccentricity", "circularity",
+
+        "centroid_x", "centroid_y", "mean_intensity", "total_intensity",
+
+        "cryab_pos_area_pix", "cryab_pos_area_percent"
+
+    ]
+
+    return pd.DataFrame(cell_data, columns=columns)
+
+
+
+
+
+def centroid_overlay(background: np.ndarray,
+
+                     labels: np.ndarray,
+
+                     out_path: Path,
+
+                     title: str) -> None:
+
+    props = regionprops(labels)
+
+    bounds = find_boundaries(labels, connectivity=2, mode="outer")
+
+
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.imshow(background, cmap='gray')
+
+    for p in props:
+
+        y, x = p.centroid
+
+        r = np.sqrt(p.area / np.pi)
+
+        ax.add_patch(Circle((x, y), r, fill=False,
+
+                            edgecolor='yellow', linewidth=1))
+
+        ax.text(x, y, f"{p.label}", color='cyan', fontsize=6)
+
+    ax.contour(bounds, colors='red', linewidths=1)
+
+    ax.axis('off')
+
+    ax.set_title(title)
+
+    plt.savefig(out_path)
+
+    plt.close()
+
+
+
+
+
+def area_heatmap_filled(labels: np.ndarray,
+
+                        sar_gray: np.ndarray,
+
+                        df_full: pd.DataFrame,
+
+                        out_path: Path) -> None:
+
+    area_vals = df_full["area_pix"].values
+
+    norm_area = mpl.colors.Normalize(vmin=area_vals.min(), vmax=area_vals.max())
+
+    cmap_area = plt.cm.get_cmap("turbo")
+
+
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.imshow(sar_gray, cmap="gray")
+
+
+
+    for reg in regionprops(labels):
+
+        mask = (labels == reg.label)
+
+        area_val = df_full.loc[df_full["cell_id"] == reg.label, "area_pix"].values[0]
+
+        color = cmap_area(norm_area(area_val))
+
+        ax.imshow(np.ma.masked_where(~mask, mask),
+
+                  cmap=mpl.colors.ListedColormap([color]),
+
+                  alpha=0.55, vmin=0, vmax=1)
+
+
+
+    bounds = find_boundaries(labels, connectivity=2, mode="outer")
+
+    ax.contour(bounds, colors='k', linewidths=0.4)
+
+
+
+    for reg in regionprops(labels):
+
+        y, x = reg.centroid
+
+        ax.text(x, y, reg.label, color='white', fontsize=6,
+
+                ha='center', va='center')
+
+
+
+    ax.set_title("Cell area heat-map")
+
+    ax.axis("off")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap_area, norm=norm_area)
+
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.046)
+
+    cbar.set_label("Cell area (pixels)")
+
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+
+    plt.close()
+
+
+
+
+
+def scatter_heatmap_centroids(df_full: pd.DataFrame,
+
+                              out_path: Path) -> None:
+
+    if "desmin_pos_area_percent" in df_full.columns:
+
+        des_vals = df_full["desmin_pos_area_percent"].values
+
+        val_col = "desmin_pos_area_percent"
+
+    else:
+
+        des_vals = df_full["cryab_pos_area_percent"].values
+
+        val_col = "cryab_pos_area_percent"
+
+
+
+    norm_des = mpl.colors.Normalize(vmin=des_vals.min(), vmax=des_vals.max())
+
+
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.imshow(np.zeros((1, 1)), alpha=0)
+
+
+
+    sc = ax.scatter(df_full["centroid_x"], df_full["centroid_y"],
+
+                    s=60, c=df_full[val_col],
+
+                    cmap="autumn_r", edgecolors="k", linewidths=0.3)
+
+    ax.invert_yaxis()
+
+    ax.set_title("Per-cell Desmin (% area positive)")
+
+    ax.axis("equal")
+
+    ax.axis("off")
+
+
+
+    cbar = plt.colorbar(sc, ax=ax)
+
+    cbar.set_label("% Desmin-positive area")
+
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+
+    plt.close()
+
+
+
+
+
+def centroid_bubbles_desmin(labels: np.ndarray,
+
+                            des_gray: np.ndarray,
+
+                            df_full: pd.DataFrame,
+
+                            out_path: Path) -> None:
+
+    if "desmin_pos_area_percent" in df_full.columns:
+
+        val_col = "desmin_pos_area_percent"
+
+    else:
+
+        val_col = "cryab_pos_area_percent"
+
+
+
+    des_vals = df_full[val_col].values
+
+    norm_des = mpl.colors.Normalize(vmin=des_vals.min(), vmax=des_vals.max())
+
+    cmap_des = plt.cm.get_cmap("autumn_r")
+
+
+
+    areas = df_full["area_pix"].values
+
+    radii = np.sqrt(areas / np.pi)
+
+    r_med = np.median(radii)
+
+    r_fixed = float(r_med * 0.35)
+
+
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.imshow(des_gray, cmap="gray")
+
+
+
+    for _, row in df_full.iterrows():
+
+        val = row[val_col]
+
+        colour = cmap_des(norm_des(val))
+
+        circ = Circle((row["centroid_x"], row["centroid_y"]),
+
+                      r_fixed, linewidth=0.8, edgecolor='k',
+
+                      facecolor=colour)
+
+        ax.add_patch(circ)
+
+
+
+    bounds = find_boundaries(labels, connectivity=2, mode="outer")
+
+    ax.contour(bounds, colors='cyan', linewidths=0.4)
+
+
+
+    for _, row in df_full.iterrows():
+
+        ax.text(row["centroid_x"], row["centroid_y"],
+
+                int(row["cell_id"]),
+
+                color='black', fontsize=6,
+
+                ha='center', va='center')
+
+
+
+    ax.set_title("Centroid circles colored by % marker positive")
+
+    ax.axis("off")
+
+    sm2 = plt.cm.ScalarMappable(cmap=cmap_des, norm=norm_des)
+
+    cbar2 = plt.colorbar(sm2, ax=ax, fraction=0.046)
+
+    cbar2.set_label("% marker-positive area")
+
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+
+    plt.close()
+
+
+
+
+
+def main() -> None:
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+    if CHECK_ENV:
+
+        print("Interpreter:", Path(sys.executable).resolve())
+
+        try:
+
+            import sarcasm  # optional
+
+            print("SarcAsM imported OK ✓")
+
+        except Exception as e:
+
+            print("SarcAsM import failed (optional):", repr(e))
+
+
+
+    # ---------- 1) Load images ----------
+
+    # Load raw images first
+
+    dapi_raw = load_image_raw(DAPI_PATH)
+
+    sar_raw = load_image_raw(SARC_PATH)
+
+    
+
+    if DESMIN_BIN_PATH is not None and DESMIN_PATH is None:
+
+        des_raw = io.imread(str(DESMIN_BIN_PATH))
+
+        if des_raw.ndim == 3:
+
+            if des_raw.shape[-1] == 4:
+
+                des_raw = des_raw[..., :3]
+
+            des_raw = color.rgb2gray(des_raw).astype(np.float32)
+
+        else:
+
+            des_raw = des_raw.astype(np.float32)
+
+    elif DESMIN_PATH is not None:
+
+        des_raw = load_image_raw(DESMIN_PATH)
+
+    else:
+
+        raise SystemExit("Set either DESMIN_PATH or DESMIN_BIN_PATH in the USER INPUT block.")
+
+
+
+    # Apply global normalization if enabled
+
+    if USE_GLOBAL_NORMALIZATION:
+
+        print(f"Applying global normalization using percentiles [{NORM_PERCENTILE_LOW}, {NORM_PERCENTILE_HIGH}]...")
+
+        images_list = [dapi_raw, des_raw, sar_raw]
+
+        normalized_list, vmin_global, vmax_global = normalize_image_global(
+
+            images_list, 
+
+            p_low=NORM_PERCENTILE_LOW, 
+            p_high=NORM_PERCENTILE_HIGH
+
+        )
+
+        dapi = normalized_list[0]
+
+        des_gray = normalized_list[1]
+
+        sar_gray = normalized_list[2]
+
+        print(f"  Global normalization range: [{vmin_global:.2f}, {vmax_global:.2f}]")
+
+    else:
+
+        # Legacy per-image normalization
+
+        dapi = load_image_gray(DAPI_PATH)
+
+        sar_gray = load_image_gray(SARC_PATH)
+
+        des_gray = load_image_gray(DESMIN_PATH) if DESMIN_PATH is not None else None
+
+        if des_gray is None:
+
+            # Handle binary Desmin case
+
+            des_raw = io.imread(str(DESMIN_BIN_PATH))
+
+            if des_raw.ndim == 3:
+
+                if des_raw.shape[-1] == 4:
+
+                    des_raw = des_raw[..., :3]
+
+                des_gray = color.rgb2gray(des_raw).astype(np.float32)
+
+            else:
+
+                des_gray = des_raw.astype(np.float32)
+
+            if des_gray.max() > 1.0:
+
+                des_gray = des_gray / 255.0
+
+            des_gray = np.clip(des_gray, 0.0, 1.0)
+
+
+
+    des_bw = binarize_gray(des_gray, DESMIN_THR)
+
+    sar_bw = binarize_gray(sar_gray, SARC_THR)
+
+
+
+    # Save binary Desmin mask
+
+    plt.imsave(OUT_DIR / "Binary_Desmin.png", des_bw,
+
+               cmap="gray", vmin=0, vmax=1)
+
+
+
+    # ---------- 2) Segment cells ----------
+
+    labels = segment_cells_from_dapi(
+
+        dapi, gauss_sigma=GAUSS_SIGMA,
+
+        min_nucleus_area=MIN_NUCLEUS_AREA
+
+    )
+
+    if labels.max() == 0:
+
+        raise RuntimeError(
+
+            "Segmentation produced zero cells. "
+
+            "Adjust GAUSS_SIGMA or MIN_NUCLEUS_AREA."
+
+        )
+
+
+
+    # *** NEW: save segmentation as label image aligned with Desmin ***
+
+    labels_uint16 = labels.astype(np.uint16)
+
+    io.imsave(OUT_DIR / "Cell_Segmentation_Labels_on_Desmin.tif", labels_uint16)
+
+
+
+    # ---------- 3) Per-cell Desmin/Sarc fractions ----------
+
+    df_basic = per_cell_table(labels, des_bw, sar_bw)
+
+    per_cell_csv = OUT_DIR / "desmin_per_cell.csv"
+
+    df_basic.to_csv(per_cell_csv, index=False)
+
+
+
+    # ---------- 4) Aggregation cutoffs ----------
+
+    valid = df_basic[df_basic["desmin_area"] > MIN_DESMIN_AREA]
+
+    if len(valid) == 0:
+
+        raise RuntimeError(
+
+            f"No cells have Desmin area > {MIN_DESMIN_AREA}."
+
+        )
+
+    d_cut, s_cut = compute_cutoffs(valid, DES_PCT, SARC_PCT)
+
+
+
+    # ---------- 5) Classify aggregated ----------
+
+    df_cls = classify(df_basic, MIN_DESMIN_AREA, d_cut, s_cut)
+
+    cls_csv = OUT_DIR / "desmin_aggregation_cells.csv"
+
+    df_cls.to_csv(cls_csv, index=False)
+
+
+
+    summary = {
+
+        "total_cells": int(len(df_basic)),
+
+        "valid_cells": int(len(valid)),
+
+        "aggregated_cells": int(df_cls["desmin_agg"].sum()),
+
+        "agg_rate_all": float(df_cls["desmin_agg"].mean()),
+
+        "agg_rate_valid": float(
+
+            df_cls.loc[df_cls["passes_min_desmin_area"], "desmin_agg"].mean()
+
+        ),
+
+        "desmin_fraction_cutoff": d_cut,
+
+        "sarcomere_fraction_cutoff": s_cut,
+
+        "min_desmin_area": int(MIN_DESMIN_AREA),
+
+        "des_pct": float(DES_PCT),
+
+        "sarc_pct": float(SARC_PCT),
+
+    }
+
+    pd.DataFrame([summary]).to_csv(
+
+        OUT_DIR / "desmin_aggregation_summary.csv",
+
+        index=False
+
+    )
+
+
+
+    df_area_fmt = df_basic[[
+
+        "cell_id", "cell_area", "desmin_area", "sarcomere_area",
+
+        "desmin_fraction", "sarcomere_fraction"
+
+    ]].copy()
+
+    df_area_fmt.to_csv(OUT_DIR / "Cell_Area_Desmin_Sarcomere.csv",
+
+                       index=False)
+
+
+
+    # ---------- 6) Full 3D-style features ----------
+
+    df_features = full_feature_table(labels, des_gray, des_bw)
+
+
+
+    df_full = pd.merge(
+
+        df_cls, df_features,
+
+        on="cell_id", how="left",
+
+        validate="one_to_one"
+
+    )
+
+
+
+    if "desmin_pos_area_percent" not in df_full.columns:
+
+        df_full["desmin_pos_area_percent"] = df_full["cryab_pos_area_percent"]
+
+
+
+    full_features_csv = OUT_DIR / "full_cell_features.csv"
+
+    df_full.to_csv(full_features_csv, index=False)
+
+
+
+    positive_subset = df_full[df_full["cryab_pos_area_percent"] > 5.0]
+
+    positive_subset.to_csv(OUT_DIR / "cryab_positive_cells.csv",
+
+                           index=False)
+
+
+
+    # ---------- 7) Overlays & heatmaps ----------
+
+    centroid_overlay(dapi, labels,
+
+                     OUT_DIR / "DAPI_Overlay.png",
+
+                     "DAPI + Circles + Boundaries")
+
+    centroid_overlay(sar_gray, labels,
+
+                     OUT_DIR / "Sarc_Overlay.png",
+
+                     "Sarc + Circles + Boundaries")
+
+    centroid_overlay(des_gray, labels,
+
+                     OUT_DIR / "Cryab_Overlay.png",
+
+                     "Cryab + Circles + Boundaries")
+
+
+
+    scatter_heatmap_centroids(df_full,
+
+                              OUT_DIR / "CRYAB_Heatmap_Scatter.png")
+
+
+
+    area_heatmap_filled(labels, sar_gray, df_full,
+
+                        OUT_DIR / "CellArea_Heatmap_Filled.png")
+
+
+
+    centroid_bubbles_desmin(labels, des_gray, df_full,
+
+                            OUT_DIR / "Desmin_Centroid_Heatmap.png")
+
+
+
+    if SAVE_SARC_OVERLAY:
+
+        ids_all = [reg.label for reg in regionprops(labels)]
+
+        save_overlay_borders(
+
+            sar_bw.astype(float),
+
+            labels,
+
+            ids_all,
+
+            OUT_DIR / "Sarcomere_withBorders_IDs.png",
+
+            "binary_sarc + Cell Borders + IDs",
+
+        )
+
+
+
+    if SAVE_DESMIN_OVERLAY:
+
+        desonly = desmin_only_mask(des_gray, sar_gray,
+
+                                   DESMIN_THR, SARC_THR)
+
+        ids_all = [reg.label for reg in regionprops(labels)]
+
+        save_overlay_borders(
+
+            desonly.astype(float),
+
+            labels,
+
+            ids_all,
+
+            OUT_DIR / "DesminOnly_NoSarcomere_withBorders_IDs.png",
+
+            "Desmin-only (no sarcomere) + Cell Borders + IDs",
+
+        )
+
+
+
+    if SAVE_AGG_OVERLAY:
+
+        agg_ids = df_full.loc[df_full["desmin_agg"], "cell_id"].tolist()
+
+        title = (
+
+            f"Desmin aggregation: ≥P{DES_PCT:.0f} Desmin frac & "
+
+            f"≤P{SARC_PCT:.0f} Sarc frac "
+
+            f"(min Desmin area {MIN_DESMIN_AREA}px)"
+
+        )
+
+        save_overlay_borders(
+
+            des_bw.astype(float),
+
+            labels,
+
+            agg_ids,
+
+            OUT_DIR / "overlay_aggregated.png",
+
+            title,
+
+        )
+
+
+
+    # ---------- 8) Report ----------
+
+    print("\n✔ Done.")
+
+    print("  Per-cell (basic):      ", per_cell_csv)
+
+    print("  Cells + flags:         ", cls_csv)
+
+    print("  Summary:               ", OUT_DIR / "desmin_aggregation_summary.csv")
+
+    print("  Full features:         ", full_features_csv)
+
+    print("  Cryab-positive subset: ", OUT_DIR / "cryab_positive_cells.csv")
+
+    print("  Segmentation labels:   ", OUT_DIR / "Cell_Segmentation_Labels_on_Desmin.tif")
+
+    print("  Scatter heatmap:       ", OUT_DIR / "CRYAB_Heatmap_Scatter.png")
+
+    print("  Area heatmap:          ", OUT_DIR / "CellArea_Heatmap_Filled.png")
+
+    print("  Centroid bubbles:      ", OUT_DIR / "Desmin_Centroid_Heatmap.png")
+
+    if SAVE_SARC_OVERLAY:
+
+        print("  Overlay (sarc):        ", OUT_DIR / "Sarcomere_withBorders_IDs.png")
+
+    if SAVE_DESMIN_OVERLAY:
+
+        print("  Overlay (des-only):    ", OUT_DIR / "DesminOnly_NoSarcomere_withBorders_IDs.png")
+
+    if SAVE_AGG_OVERLAY:
+
+        print("  Overlay (agg):         ", OUT_DIR / "overlay_aggregated.png")
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
